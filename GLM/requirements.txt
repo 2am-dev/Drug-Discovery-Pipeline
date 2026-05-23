@@ -1,0 +1,9 @@
+# drug_discovery_pipeline/requirements.txt
+requests>=2.31.0
+openai>=1.12.0
+chromadb>=0.4.22
+beautifulsoup4>=4.12.0
+feedparser>=6.0.0
+pandas>=2.0.0
+rdkit-pypi>=2023.9.1
+pydantic>=2.5.0
