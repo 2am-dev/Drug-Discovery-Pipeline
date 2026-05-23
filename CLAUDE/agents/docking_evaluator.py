@@ -2,15 +2,14 @@
 # =============================================================================
 # FILE: agents/docking_evaluator.py
 # ROLE: Molecular docking evaluation agent.
-#       Docks each shortlisted SMILES candidate against the target receptor.
-#       Uses AutoDock Vina (or mock scorer) via the docking tool.
-#       Calls LLM to interpret results and rank candidates.
+#       Docking itself: RDKit + Vina subprocess (local, no LLM)
+#       Result interpretation: REMOTE gemma4:31b  (task="docking_interpret")
 # =============================================================================
 
 import logging
 
 from tools.docking import dock_multiple
-from utils.helpers import llm_call, safe_extract_json
+from utils.helpers import routed_llm_call, safe_extract_json
 from utils.prompts import docking_interpretation_prompt
 
 log = logging.getLogger("drug_discovery.docking_evaluator")
@@ -18,66 +17,49 @@ log = logging.getLogger("drug_discovery.docking_evaluator")
 
 class DockingEvaluatorAgent:
     """
-    Evaluates binding affinity of shortlisted molecules via docking.
-
-    Expects state keys: candidates, hypothesis, target_info
-    Produces state keys: docking_results
+    Docking computation  → Vina/mock (local, RDKit)
+    Result interpretation → REMOTE gemma4:31b
     """
 
     def run(self, state: dict) -> dict:
         log.info("DockingEvaluatorAgent running...")
-
-        shortlist = state.get("candidates", {}).get("shortlist", [])
+        shortlist  = state.get("candidates", {}).get("shortlist", [])
         if not shortlist:
-            log.warning("No shortlisted candidates to dock.")
+            log.warning("No shortlisted candidates.")
             state["docking_results"] = []
             return state
 
-        target = state.get("hypothesis", {}).get("selected_target", {})
-        pdb_local = state.get("hypothesis", {}).get("pdb_local_path", "")
+        target     = state.get("hypothesis", {}).get("selected_target", {})
+        pdb_local  = state.get("hypothesis", {}).get("pdb_local_path", "")
+        smi_list   = [m["smiles"] for m in shortlist]
 
-        smiles_list = [m["smiles"] for m in shortlist]
-        log.info(f"Docking {len(smiles_list)} candidates...")
+        raw_results = dock_multiple(smi_list, receptor_pdbqt_path=pdb_local or None)
 
-        # ── Run docking ────────────────────────────────────────────────
-        raw_results = dock_multiple(
-            smiles_list=smiles_list,
-            receptor_pdbqt_path=pdb_local or None,
-        )
-
-        # ── Merge with property data ───────────────────────────────────
         props_map = {m["smiles"]: m for m in shortlist}
         for r in raw_results:
-            mol_props = props_map.get(r["smiles"], {})
-            r.update(
-                {
-                    "QED": mol_props.get("QED", "N/A"),
-                    "MW": mol_props.get("MW", "N/A"),
-                    "LogP": mol_props.get("LogP", "N/A"),
-                    "SA_Score": mol_props.get("SA_Score", "N/A"),
-                    "docking_mode": r.get("mode", "unknown"),
-                }
-            )
+            mp = props_map.get(r["smiles"], {})
+            r.update({
+                "QED": mp.get("QED","N/A"), "MW": mp.get("MW","N/A"),
+                "LogP": mp.get("LogP","N/A"), "SA_Score": mp.get("SA_Score","N/A"),
+                "docking_mode": r.get("mode","unknown"),
+            })
 
         state["docking_results"] = raw_results
         log.info(
-            f"Docking complete. Best score: "
+            f"Docking done. Best: "
             f"{raw_results[0]['score'] if raw_results else 'N/A'} kcal/mol"
         )
 
-        # ── LLM interpretation ─────────────────────────────────────────
+        # ── LLM interpretation (REMOTE) ───────────────────────────────
         try:
             messages = docking_interpretation_prompt(target, raw_results)
-            raw = llm_call(messages)
-            interpretation = safe_extract_json(raw)
-            if interpretation:
-                state["docking_interpretation"] = interpretation
-                log.info(
-                    f"Best candidate identified: "
-                    f"{interpretation.get('best_candidate', 'N/A')[:60]}"
-                )
+            raw = routed_llm_call("docking_interpret", messages)   # ← REMOTE
+            interp = safe_extract_json(raw)
+            if interp:
+                state["docking_interpretation"] = interp
+                log.info(f"Best candidate: {interp.get('best_candidate','?')[:60]}")
         except Exception as e:
-            log.error(f"Docking interpretation LLM call failed: {e}")
+            log.error(f"Docking interpretation failed: {e}")
             state["docking_interpretation"] = {}
 
         return state

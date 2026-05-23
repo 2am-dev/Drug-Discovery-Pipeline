@@ -2,9 +2,9 @@
 # =============================================================================
 # FILE: agents/report_compiler.py
 # ROLE: Report compilation agent.
-#       Assembles all pipeline outputs into a structured Markdown report.
-#       Uses the LLM to write an executive summary and polish each section.
-#       Saves the final report to outputs/ with a timestamp.
+#       Executive summary / conclusion → REMOTE gemma4:31b
+#       Section polishing              → LOCAL  mistral:7b  (fast, good enough)
+#       Assembly                       → pure Python string ops
 # =============================================================================
 
 import logging
@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from config import OUTPUT_DIR
-from utils.helpers import llm_call, save_text, timestamp, truncate
+from utils.helpers import routed_llm_call, save_text, timestamp, truncate
 from utils.prompts import executive_summary_prompt, section_polish_prompt
 
 log = logging.getLogger("drug_discovery.report_compiler")
@@ -20,413 +20,288 @@ log = logging.getLogger("drug_discovery.report_compiler")
 
 class ReportCompilerAgent:
     """
-    Compiles all agent outputs into a polished Markdown project proposal.
-
-    Expects all populated state keys.
-    Produces state keys: report, report_path
+    Heavy LLM tasks  → REMOTE gemma4:31b   (executive_summary, conclusion)
+    Section polishing → LOCAL mistral:7b   (section_polish)
     """
 
     def run(self, state: dict) -> dict:
         log.info("ReportCompilerAgent running...")
-
         sections = []
 
-        # ── 1. Executive Summary (LLM-generated) ───────────────────────
-        exec_summary = self._write_executive_summary(state)
-        sections.append(("Executive Summary", exec_summary))
-
-        # ── 2. Research Plan ───────────────────────────────────────────
-        plan_section = self._write_plan_section(state)
-        sections.append(("Research Plan", plan_section))
-
-        # ── 3. Literature & Patent Review ─────────────────────────────
-        lit_section = self._write_literature_section(state)
-        sections.append(("Literature & Patent Review", lit_section))
-
-        # ── 4. Target Selection & Hypothesis ──────────────────────────
-        hyp_section = self._write_hypothesis_section(state)
-        sections.append(("Target Selection & Mechanistic Hypothesis", hyp_section))
-
-        # ── 5. Molecule Design ─────────────────────────────────────────
-        mol_section = self._write_molecule_section(state)
-        sections.append(("De Novo Molecule Design", mol_section))
-
-        # ── 6. Docking Evaluation ─────────────────────────────────────
-        dock_section = self._write_docking_section(state)
-        sections.append(("Molecular Docking Evaluation", dock_section))
-
-        # ── 7. Synthetic Route ─────────────────────────────────────────
-        synth_section = self._write_synthesis_section(state)
-        sections.append(("Synthetic Feasibility & Proposed Routes", synth_section))
-
-        # ── 8. Next Steps & Conclusion ─────────────────────────────────
-        conclusion = self._write_conclusion(state)
-        sections.append(("Conclusions & Next Steps", conclusion))
-
-        # ── 9. Errors / Caveats ────────────────────────────────────────
+        # ① Executive summary — REMOTE
+        sections.append(("Executive Summary",            self._exec_summary(state)))
+        # ② Plan
+        sections.append(("Research Plan",                self._plan(state)))
+        # ③ Literature — POLISHED locally
+        sections.append(("Literature & Patent Review",   self._literature(state)))
+        # ④ Hypothesis
+        sections.append(("Target Selection & Hypothesis", self._hypothesis(state)))
+        # ⑤ Molecules
+        sections.append(("De Novo Molecule Design",      self._molecules(state)))
+        # ⑥ Docking
+        sections.append(("Molecular Docking Evaluation", self._docking(state)))
+        # ⑦ Synthesis
+        sections.append(("Synthetic Feasibility",        self._synthesis(state)))
+        # ⑧ Conclusion — REMOTE
+        sections.append(("Conclusions & Next Steps",     self._conclusion(state)))
+        # ⑨ Errors
         if state.get("errors"):
-            errors_section = self._write_errors_section(state)
-            sections.append(("Pipeline Notes & Caveats", errors_section))
+            sections.append(("Pipeline Notes & Caveats", self._errors(state)))
 
-        # ── Assemble markdown ─────────────────────────────────────────
-        report = self._assemble_report(state, sections)
+        report = self._assemble(state, sections)
         state["report"] = report
 
-        # ── Save to disk ──────────────────────────────────────────────
         fname = f"proposal_{state.get('run_id', timestamp())}.md"
-        report_path = OUTPUT_DIR / fname
-        save_text(report_path, report)
-        state["report_path"] = str(report_path)
-
-        log.info(f"Report saved: {report_path}")
+        path  = OUTPUT_DIR / fname
+        save_text(path, report)
+        state["report_path"] = str(path)
+        log.info(f"Report saved: {path}")
         return state
 
     # ------------------------------------------------------------------
-    # Section writers
+    # LLM-heavy sections
     # ------------------------------------------------------------------
 
-    def _write_executive_summary(self, state: dict) -> str:
+    def _exec_summary(self, state: dict) -> str:
         try:
-            messages = executive_summary_prompt(state)
-            return llm_call(messages)
+            msgs = executive_summary_prompt(state)
+            return routed_llm_call("executive_summary", msgs)   # ← REMOTE
         except Exception as e:
-            log.error(f"Executive summary generation failed: {e}")
-            return (
-                f"This report presents AI-generated drug discovery findings for "
-                f"**{state.get('input', 'the specified indication')}**. "
-                f"(Executive summary generation encountered an error: {e})"
-            )
+            log.error(f"Executive summary failed: {e}")
+            return f"Executive summary unavailable (error: {e})"
 
-    def _write_plan_section(self, state: dict) -> str:
+    def _conclusion(self, state: dict) -> str:
+        hyp    = state.get("hypothesis", {})
+        target = hyp.get("selected_target", {})
+        dr     = state.get("docking_results", [])
+        synth  = state.get("synthesis", [])
+
+        best_score = dr[0].get("score","N/A") if dr else "N/A"
+        best_smi   = dr[0].get("smiles","N/A") if dr else "N/A"
+        feasibility = synth[0].get("feasibility","N/A") if synth else "N/A"
+
+        raw = f"""
+| Item | Detail |
+|---|---|
+| Disease | {state.get('input','N/A')} |
+| Target | {target.get('gene_name','N/A')} ({target.get('uniprot_id','')}) |
+| PDB | {target.get('pdb_id','N/A')} |
+| Best Docking Score | {best_score} kcal/mol |
+| Top Candidate | `{str(best_smi)[:60]}` |
+| Synthetic Feasibility | {feasibility} |
+
+**Recommended next steps:**
+1. Biochemical assay validation (enzyme inhibition, SPR binding).
+2. 100 ns MD simulation on the best docking pose.
+3. Synthesis of 3-5 analogues to establish initial SAR.
+4. ADMET profiling (computational + cell-based).
+5. Freedom-to-operate patent analysis.
+6. IND-enabling in vivo efficacy studies.
+
+All computational predictions require experimental validation.
+Docking scores marked 'mock' must be replaced with real Vina runs.
+"""
+        try:
+            from utils.prompts import build_messages, REPORT_SYSTEM
+            msgs = build_messages(
+                REPORT_SYSTEM,
+                f"Polish and expand this conclusions section into prose "
+                f"(keep the table):\n\n{raw}"
+            )
+            return routed_llm_call("conclusion", msgs)   # ← REMOTE
+        except Exception as e:
+            log.warning(f"Conclusion polish failed: {e}")
+            return raw.strip()
+
+    # ------------------------------------------------------------------
+    # Locally-polished sections (mistral:7b)
+    # ------------------------------------------------------------------
+
+    def _polish(self, title: str, raw: str) -> str:
+        try:
+            msgs = section_polish_prompt(title, truncate(raw, 1500))
+            return routed_llm_call("section_polish", msgs)   # ← LOCAL mistral:7b
+        except Exception as e:
+            log.warning(f"Polish failed for '{title}': {e}")
+            return raw
+
+    # ------------------------------------------------------------------
+    # Pure-Python section builders (no LLM needed)
+    # ------------------------------------------------------------------
+
+    def _plan(self, state: dict) -> str:
         phases = state.get("plan", [])
         if not phases:
-            return "_No plan data available._"
+            return "_No plan data._"
         lines = []
         for ph in phases:
             lines.append(
-                f"**Phase {ph.get('phase_number', '?')}: {ph.get('phase_name', '')}**\n"
-                f"{ph.get('description', '')}"
+                f"**Phase {ph.get('phase_number','?')}: {ph.get('phase_name','')}**\n"
+                f"{ph.get('description','')}"
             )
-            outputs = ph.get("expected_outputs", [])
-            if outputs:
-                lines.append("Expected outputs: " + "; ".join(outputs))
+            for o in ph.get("expected_outputs", []):
+                lines.append(f"  - {o}")
             lines.append("")
         return "\n".join(lines)
 
-    def _write_literature_section(self, state: dict) -> str:
-        lit = state.get("literature", {})
-        patents = state.get("patents", {})
-        synthesis = lit.get("synthesis", {})
-
-        lines = ["### Literature Review\n"]
-        lines.append(f"**Articles retrieved:** {lit.get('count', 0)}\n")
-
-        if synthesis.get("summary"):
-            lines.append(f"**State of the art:**\n{synthesis['summary']}\n")
-
-        if synthesis.get("key_targets"):
-            lines.append("**Key targets mentioned in literature:**")
-            for t in synthesis["key_targets"][:8]:
-                lines.append(f"  - {t}")
-            lines.append("")
-
-        if synthesis.get("known_mechanisms"):
-            lines.append("**Mechanisms of action reported:**")
-            for m in synthesis["known_mechanisms"][:6]:
-                lines.append(f"  - {m}")
-            lines.append("")
-
-        if synthesis.get("research_gaps"):
-            lines.append("**Identified research gaps:**")
-            for g in synthesis["research_gaps"][:5]:
-                lines.append(f"  - {g}")
-            lines.append("")
-
-        lines.append("### Patent Landscape\n")
-        lines.append(f"**Patents indexed:** {patents.get('patent_count', 0)}\n")
-        claims = patents.get("chemical_claims", [])
+    def _literature(self, state: dict) -> str:
+        lit  = state.get("literature", {})
+        pat  = state.get("patents", {})
+        syn  = lit.get("synthesis", {})
+        lines = [
+            f"**Articles retrieved:** {lit.get('count',0)}\n",
+            f"**Summary:** {syn.get('summary','')}\n",
+        ]
+        if syn.get("key_targets"):
+            lines.append("**Key targets:**")
+            for t in syn["key_targets"][:6]: lines.append(f"  - {t}")
+        if syn.get("research_gaps"):
+            lines.append("\n**Research gaps:**")
+            for g in syn["research_gaps"][:4]: lines.append(f"  - {g}")
+        lines += [
+            f"\n**Patents indexed:** {pat.get('patent_count',0)}",
+        ]
+        claims = pat.get("chemical_claims", [])
         if claims:
-            lines.append("**Chemical entities extracted from patent claims:**")
-            for c in claims[:5]:
-                lines.append(f"  - `{c[:80]}`")
+            lines.append("**Chemical claims extracted:**")
+            for c in claims[:5]: lines.append(f"  - `{c[:80]}`")
+        raw = "\n".join(lines)
+        return self._polish("Literature & Patent Review", raw)
 
-        polished = self._polish_section("Literature & Patent Review", "\n".join(lines))
-        return polished
-
-    def _write_hypothesis_section(self, state: dict) -> str:
+    def _hypothesis(self, state: dict) -> str:
         hyp = state.get("hypothesis", {})
-        target = hyp.get("selected_target", {})
+        tgt = hyp.get("selected_target", {})
+        return "\n".join([
+            "### Selected Target\n",
+            "| Property | Value |", "|---|---|",
+            f"| Gene | **{tgt.get('gene_name','N/A')}** |",
+            f"| UniProt | {tgt.get('uniprot_id','N/A')} |",
+            f"| PDB | {tgt.get('pdb_id','N/A')} |",
+            f"| Druggability | {hyp.get('druggability_score','N/A')} |",
+            f"| Confidence | {hyp.get('confidence','N/A')} |",
+            f"\n**Rationale:** {tgt.get('rationale','')}",
+            "\n### Mechanistic Hypothesis\n",
+            f"> {hyp.get('hypothesis','Not available.')}",
+            f"\n### Justification\n{hyp.get('justification','')}",
+        ])
 
-        lines = [
-            f"### Selected Target\n",
-            f"| Property | Value |",
-            f"|---|---|",
-            f"| Gene Name | **{target.get('gene_name', 'N/A')}** |",
-            f"| UniProt ID | {target.get('uniprot_id', 'N/A')} |",
-            f"| PDB ID | {target.get('pdb_id', 'N/A')} |",
-            f"| Druggability Score | {hyp.get('druggability_score', 'N/A')} |",
-            f"| Confidence | {hyp.get('confidence', 'N/A')} |",
-            "",
-            f"**Rationale:** {target.get('rationale', '')}",
-            "",
-            "### Mechanistic Hypothesis",
-            "",
-            f"> {hyp.get('hypothesis', 'Not available.')}",
-            "",
-            "### Justification",
-            "",
-            hyp.get("justification", ""),
+    def _molecules(self, state: dict) -> str:
+        cands  = state.get("candidates", {})
+        stats  = cands.get("generation_stats", {})
+        short  = cands.get("shortlist", [])
+        pharma = state.get("pharmacophore", {})
+        lines  = [
+            "### Generation Stats\n",
+            "| Metric | Value |", "|---|---|",
+            f"| Generated | {stats.get('total_generated','N/A')} |",
+            f"| Valid     | {stats.get('valid_molecules','N/A')} |",
+            f"| Drug-like | {stats.get('drug_like','N/A')} |",
+            f"| Shortlist | {stats.get('shortlisted','N/A')} |",
+            "\n### Pharmacophore\n",
         ]
-        return "\n".join(lines)
-
-    def _write_molecule_section(self, state: dict) -> str:
-        candidates = state.get("candidates", {})
-        stats = candidates.get("generation_stats", {})
-        shortlist = candidates.get("shortlist", [])
-        pharmacophore = state.get("pharmacophore", {})
-        llm_commentary = candidates.get("llm_commentary", {})
-
-        lines = [
-            "### Generation Statistics\n",
-            f"| Metric | Value |",
-            f"|---|---|",
-            f"| Total generated | {stats.get('total_generated', 'N/A')} |",
-            f"| Valid molecules | {stats.get('valid_molecules', 'N/A')} |",
-            f"| Drug-like (Lipinski+QED+SA) | {stats.get('drug_like', 'N/A')} |",
-            f"| Shortlisted | {stats.get('shortlisted', 'N/A')} |",
-            "",
-            "### Pharmacophore Features\n",
-        ]
-
-        features = pharmacophore.get("pharmacophore_features", [])
-        for f in features:
-            lines.append(f"  - {f}")
-        lines.append("")
-
-        if pharmacophore.get("design_strategy"):
-            lines.append(
-                f"**Design strategy:** {pharmacophore['design_strategy']}\n"
-            )
-
-        lines.append("### Shortlisted Candidates\n")
-        if shortlist:
-            lines.append(
-                "| # | SMILES | MW | LogP | QED | SA Score | TPSA |"
-            )
-            lines.append("|---|--------|-----|------|-----|----------|------|")
-            for i, mol in enumerate(shortlist, 1):
-                smi = mol.get("smiles", "")
+        for f in pharma.get("pharmacophore_features", []): lines.append(f"  - {f}")
+        if pharma.get("design_strategy"):
+            lines.append(f"\n**Strategy:** {pharma['design_strategy']}\n")
+        lines.append("\n### Shortlisted Candidates\n")
+        if short:
+            lines.append("| # | SMILES | MW | LogP | QED | SA |")
+            lines.append("|---|--------|-----|------|-----|----|")
+            for i, m in enumerate(short, 1):
+                s = m.get("smiles","")
                 lines.append(
-                    f"| {i} | `{smi[:50]}{'...' if len(smi)>50 else ''}` | "
-                    f"{mol.get('MW', '')} | {mol.get('LogP', '')} | "
-                    f"{mol.get('QED', '')} | {mol.get('SA_Score', '')} | "
-                    f"{mol.get('TPSA', '')} |"
+                    f"| {i} | `{s[:45]}{'...' if len(s)>45 else ''}` | "
+                    f"{m.get('MW','')} | {m.get('LogP','')} | "
+                    f"{m.get('QED','')} | {m.get('SA_Score','')} |"
                 )
-            lines.append("")
-
-        if llm_commentary and llm_commentary.get("design_notes"):
-            lines.append(f"**Design notes:** {llm_commentary['design_notes']}")
-
         return "\n".join(lines)
 
-    def _write_docking_section(self, state: dict) -> str:
+    def _docking(self, state: dict) -> str:
         results = state.get("docking_results", [])
-        interp = state.get("docking_interpretation", {})
-        mode_note = ""
-
-        lines = ["### Docking Results\n"]
-
+        interp  = state.get("docking_interpretation", {})
         if not results:
-            return "_No docking results available._"
-
-        # Detect if mock was used
-        mock_used = any(r.get("docking_mode", "").startswith("mock") for r in results)
-        if mock_used:
-            lines.append(
-                "> ⚠️ **Note:** One or more docking scores are **mock/estimated** values "
-                "because AutoDock Vina or the receptor PDBQT was unavailable. "
-                "Replace with real Vina runs before making scientific decisions.\n"
-            )
-
-        lines.append(
-            "| Rank | SMILES | Score (kcal/mol) | QED | MW | Mode |"
-        )
-        lines.append("|------|--------|------------------|-----|----|------|")
-        for i, r in enumerate(results, 1):
-            smi = r.get("smiles", "")
-            lines.append(
-                f"| {i} | `{smi[:45]}{'...' if len(smi)>45 else ''}` | "
-                f"**{r.get('score', 'N/A')}** | "
-                f"{r.get('QED', 'N/A')} | {r.get('MW', 'N/A')} | "
-                f"{r.get('docking_mode', 'N/A')} |"
-            )
-        lines.append("")
-
-        if interp.get("structural_insights"):
-            lines.append(f"**Structural insights:** {interp['structural_insights']}\n")
-
-        if interp.get("best_candidate"):
-            lines.append(
-                f"**Top candidate:** `{interp['best_candidate'][:80]}`"
-            )
-
-        return "\n".join(lines)
-
-    def _write_synthesis_section(self, state: dict) -> str:
-        synthesis = state.get("synthesis", [])
-        if not synthesis:
-            return "_No synthesis data available._"
-
+            return "_No docking results._"
         lines = []
-        for i, res in enumerate(synthesis, 1):
-            lines.append(f"### Candidate {i}: `{res.get('smiles', '')[:60]}`\n")
+        mock = any(r.get("docking_mode","").startswith("mock") for r in results)
+        if mock:
             lines.append(
-                f"| Property | Value |\n|---|---|\n"
-                f"| SA Score | {res.get('sa_score', 'N/A')} |\n"
-                f"| SA Category | {res.get('sa_category', 'N/A')} |\n"
-                f"| Estimated Steps | {res.get('estimated_steps', 'N/A')} |\n"
-                f"| Feasibility | {res.get('feasibility', 'N/A')} |\n"
+                "> ⚠️ **Mock scores** — Vina/PDBQT unavailable. "
+                "Replace before scientific use.\n"
             )
-
-            disc = res.get("rule_based_disconnections", [])
-            if disc:
-                lines.append("**Retrosynthetic disconnections:**")
-                for d in disc:
-                    lines.append(f"  {d}")
-                lines.append("")
-
-            llm_route = res.get("llm_route", {})
-            if isinstance(llm_route, dict) and llm_route.get("forward_route"):
-                lines.append("**Proposed forward synthetic route:**\n")
-                for step in llm_route["forward_route"]:
-                    lines.append(
-                        f"  **Step {step.get('step', '?')}:** "
-                        f"{step.get('reaction', '')} — "
-                        f"Reagents: {step.get('reagents', '')} | "
-                        f"Conditions: {step.get('conditions', '')} | "
-                        f"Expected yield: ~{step.get('expected_yield_percent', '?')}%"
-                    )
-                lines.append("")
-
-            if llm_route.get("key_challenges"):
-                lines.append("**Key synthetic challenges:**")
-                for ch in llm_route["key_challenges"]:
-                    lines.append(f"  - {ch}")
-                lines.append("")
-
-            lines.append("---\n")
-
+        lines += ["| Rank | SMILES | Score (kcal/mol) | QED | Mode |",
+                  "|------|--------|------------------|-----|------|"]
+        for i, r in enumerate(results, 1):
+            s = r.get("smiles","")
+            lines.append(
+                f"| {i} | `{s[:40]}{'...' if len(s)>40 else ''}` | "
+                f"**{r.get('score','N/A')}** | {r.get('QED','N/A')} | "
+                f"{r.get('docking_mode','N/A')} |"
+            )
+        if interp.get("structural_insights"):
+            lines.append(f"\n**Structural insights:** {interp['structural_insights']}")
+        if interp.get("best_candidate"):
+            lines.append(f"\n**Top candidate:** `{interp['best_candidate'][:80]}`")
         return "\n".join(lines)
 
-    def _write_conclusion(self, state: dict) -> str:
-        hyp = state.get("hypothesis", {})
-        target = hyp.get("selected_target", {})
-        best_score = "N/A"
-        best_smiles = "N/A"
-
-        dr = state.get("docking_results", [])
-        if dr:
-            best_score = dr[0].get("score", "N/A")
-            best_smiles = dr[0].get("smiles", "N/A")
-
+    def _synthesis(self, state: dict) -> str:
         synth = state.get("synthesis", [])
-        feasibility = synth[0].get("feasibility", "N/A") if synth else "N/A"
-
-        text = f"""
-### Summary of Key Findings
-
-| Item | Detail |
-|------|--------|
-| Disease / Indication | {state.get('input', 'N/A')} |
-| Selected Target | {target.get('gene_name', 'N/A')} ({target.get('uniprot_id', '')}) |
-| PDB Structure | {target.get('pdb_id', 'N/A')} |
-| Best Docking Score | {best_score} kcal/mol |
-| Top Candidate SMILES | `{str(best_smiles)[:60]}` |
-| Synthetic Feasibility | {feasibility} |
-
-### Recommended Next Steps
-
-1. **Experimental validation** – Test top candidates in biochemical assays
-   (enzyme inhibition, binding assays, SPR).
-2. **MD simulations** – Run 100 ns molecular dynamics on the top docking pose
-   to assess binding stability.
-3. **Analogue synthesis** – Synthesise 3-5 structurally related analogues to
-   establish an initial SAR.
-4. **ADMET profiling** – Assess absorption, distribution, metabolism, excretion
-   and toxicity using cell-based assays and computational tools.
-5. **Patent freedom-to-operate** – Conduct a detailed FTO analysis before
-   entering synthesis.
-6. **IND-enabling studies** – Plan in vivo efficacy studies in relevant disease
-   models.
-
-### Confidence Assessment
-
-This proposal was generated using AI-driven methods. All computational
-predictions (docking scores, SA scores, binding hypotheses) require
-experimental validation. Docking scores marked as 'mock' are estimates
-and should be replaced with real AutoDock Vina runs using a prepared
-receptor PDBQT file.
-"""
-        return text.strip()
-
-    def _write_errors_section(self, state: dict) -> str:
-        errors = state.get("errors", [])
-        if not errors:
-            return ""
-        lines = [
-            "_The following non-fatal errors were recorded during the pipeline run:_\n"
-        ]
-        for e in errors:
-            lines.append(f"- **{e.get('agent', 'Unknown')}** ({e.get('time', '')}): {e.get('error', '')}")
+        if not synth:
+            return "_No synthesis data._"
+        lines = []
+        for i, res in enumerate(synth, 1):
+            lines += [
+                f"### Candidate {i}: `{res.get('smiles','')[:60]}`\n",
+                "| Property | Value |", "|---|---|",
+                f"| SA Score | {res.get('sa_score','N/A')} |",
+                f"| Category | {res.get('sa_category','N/A')} |",
+                f"| Est. Steps | {res.get('estimated_steps','N/A')} |",
+                f"| Feasibility | {res.get('feasibility','N/A')} |",
+                "",
+            ]
+            for d in res.get("rule_based_disconnections", []):
+                lines.append(f"  {d}")
+            route = res.get("llm_route", {})
+            if isinstance(route, dict):
+                for step in route.get("forward_route", []):
+                    lines.append(
+                        f"  **Step {step.get('step','?')}:** "
+                        f"{step.get('reaction','')} | "
+                        f"{step.get('reagents','')} | "
+                        f"~{step.get('expected_yield_percent','?')}%"
+                    )
+            lines.append("---\n")
         return "\n".join(lines)
 
-    def _polish_section(self, title: str, raw: str) -> str:
-        """Ask the LLM to improve a section's language."""
-        try:
-            messages = section_polish_prompt(title, truncate(raw, 1500))
-            return llm_call(messages)
-        except Exception as e:
-            log.warning(f"Section polishing failed for '{title}': {e}")
-            return raw  # Return unpolished if LLM fails
+    def _errors(self, state: dict) -> str:
+        errs = state.get("errors", [])
+        lines = ["_Non-fatal pipeline errors:_\n"]
+        for e in errs:
+            lines.append(f"- **{e.get('agent','')}**: {e.get('error','')}")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Assembly
     # ------------------------------------------------------------------
 
-    def _assemble_report(
-        self, state: dict, sections: list[tuple[str, str]]
-    ) -> str:
-        """Combine all sections into a full Markdown document."""
-        run_id = state.get("run_id", "unknown")
-        disease = state.get("input", "Unknown")
+    def _assemble(self, state: dict, sections: list[tuple[str,str]]) -> str:
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-
-        header = f"""# Drug Discovery Project Proposal
-## {disease}
-
-**Generated by:** End-to-End AI Drug Discovery Pipeline  
-**Date:** {now}  
-**Run ID:** `{run_id}`  
-**LLM:** Ollama (local)  
-
----
-
-"""
-        toc_lines = ["## Table of Contents\n"]
-        for i, (title, _) in enumerate(sections, 1):
-            slug = title.lower().replace(" ", "-").replace("&", "").replace("/", "")
-            toc_lines.append(f"{i}. [{title}](#{slug})")
-        toc = "\n".join(toc_lines) + "\n\n---\n\n"
-
-        body_parts = []
-        for title, content in sections:
-            body_parts.append(f"## {title}\n\n{content}\n\n---\n")
-
-        footer = (
-            "\n\n---\n*This report was automatically generated by the "
-            "Drug Discovery AI Pipeline using open-source tools and a local "
-            "Ollama LLM server. All findings are computational predictions "
-            "and must be experimentally validated.*\n"
+        hdr = (
+            f"# Drug Discovery Project Proposal\n"
+            f"## {state.get('input','Unknown')}\n\n"
+            f"**Date:** {now}  \n"
+            f"**Run ID:** `{state.get('run_id','?')}`  \n"
+            f"**Primary LLM:** gemma4:31b-it-q8_0 (REMOTE A6000)  \n"
+            f"**Bio LLM:** medgemma1.5 (LOCAL 5070 Ti)  \n"
+            f"**Code LLM:** deepseek-coder:6.7b (LOCAL 5070 Ti)  \n\n---\n\n"
         )
+        toc = "## Table of Contents\n\n"
+        for i, (title, _) in enumerate(sections, 1):
+            slug = title.lower().replace(" ","‑").replace("&","").replace("/","")
+            toc += f"{i}. [{title}](#{slug})\n"
+        toc += "\n---\n\n"
 
-        return header + toc + "\n".join(body_parts) + footer
+        body = "\n".join(f"## {t}\n\n{c}\n\n---\n" for t, c in sections)
+        footer = (
+            "\n\n---\n*Generated by AI Drug Discovery Pipeline. "
+            "Computational predictions only — experimental validation required.*\n"
+        )
+        return hdr + toc + body + footer
