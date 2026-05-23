@@ -1,0 +1,27 @@
+drug_discovery_pipeline/
+├── .env                          ← Your local secrets (gitignored)
+├── .env.example                  ← Safe template to commit
+├── .gitignore                    ← Comprehensive ignore rules
+├── .pre-commit-config.yaml       ← Pre-commit hooks (formatter, secret scanner)
+├── .github/
+│   └── workflows/
+│       └── ci.yml                ← GitHub Actions CI
+├── pyproject.toml                ← Modern project config + tool settings
+├── setup.cfg                     ← Legacy setuptools compat
+├── Makefile                      ← Developer shortcuts (make run, make test...)
+├── load_env.py                   ← Bootstrap: loads .env before config imports
+├── scripts/
+│   ├── check_environment.sh      ← Pre-flight checker
+│   └── setup_conda_env.sh        ← One-shot conda setup
+├── tests/
+│   ├── __init__.py
+│   ├── conftest.py               ← Fixtures, marks, mock LLM
+│   ├── test_config.py
+│   ├── test_helpers.py
+│   ├── test_molecule_generator.py
+│   ├── test_docking.py
+│   ├── test_synthesis_checker.py
+│   └── test_agents.py
+├── outputs/.gitkeep
+├── workdir/.gitkeep
+└── chroma_db/.gitkeep

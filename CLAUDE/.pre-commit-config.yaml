@@ -1,0 +1,78 @@
+# drug_discovery_pipeline/.pre-commit-config.yaml
+# =============================================================================
+# FILE: .pre-commit-config.yaml
+# ROLE: Git pre-commit hooks configuration.
+#       Runs formatters, linters and secret-scanners before each commit.
+#
+# Install hooks:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Run manually on all files:
+#   pre-commit run --all-files
+# =============================================================================
+
+repos:
+  # ── Standard pre-commit hooks ──────────────────────────────────────────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-added-large-files
+        args: ["--maxkb=5000"]          # block files > 5 MB
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-symlinks
+      - id: detect-private-key          # block accidental key commits
+      - id: no-commit-to-branch
+        args: ["--branch", "main", "--branch", "master"]
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+      - id: debug-statements            # catch leftover breakpoint() calls
+
+  # ── Secret scanning ────────────────────────────────────────────────────────
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.4.0
+    hooks:
+      - id: detect-secrets
+        args: ["--baseline", ".secrets.baseline"]
+        exclude: >
+          (?x)^(
+            \.env\.example|
+            README\.md|
+            .*\.md
+          )$
+
+  # ── Black (code formatter) ─────────────────────────────────────────────────
+  - repo: https://github.com/psf/black
+    rev: 24.3.0
+    hooks:
+      - id: black
+        language_version: python3.10
+
+  # ── isort (import sorter) ──────────────────────────────────────────────────
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ["--profile", "black"]
+
+  # ── Ruff (fast linter) ─────────────────────────────────────────────────────
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.3.5
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+
+  # ── Check .env files are not committed ────────────────────────────────────
+  - repo: local
+    hooks:
+      - id: no-dotenv
+        name: Block .env commit
+        language: fail
+        entry: "Do not commit .env — use .env.example instead"
+        files: "^\.env$"

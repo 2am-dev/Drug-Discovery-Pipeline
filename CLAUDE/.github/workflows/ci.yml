@@ -1,0 +1,132 @@
+# drug_discovery_pipeline/.github/workflows/ci.yml
+# =============================================================================
+# FILE: .github/workflows/ci.yml
+# ROLE: GitHub Actions CI pipeline.
+#       Runs on every push and pull request to main/develop.
+#       Tests on Python 3.10, 3.11, 3.12.
+#       Skips LLM/Ollama tests (requires local server) — marks them xfail.
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+
+jobs:
+  lint:
+    name: Lint & Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install lint dependencies
+        run: |
+          pip install --upgrade pip
+          pip install black isort ruff
+
+      - name: Black format check
+        run: black --check --diff .
+
+      - name: isort check
+        run: isort --check-only --diff .
+
+      - name: Ruff lint
+        run: ruff check .
+
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+            ${{ runner.os }}-pip-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libxrender1 libxext6  # for RDKit
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install rdkit-pypi 2>/dev/null || pip install rdkit 2>/dev/null || echo "RDKit via conda needed"
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-mock
+
+      - name: Create required directories
+        run: |
+          mkdir -p outputs workdir chroma_db
+
+      - name: Create .env from example
+        run: |
+          cp .env.example .env
+          sed -i 's|REPLACE_WITH_REMOTE_HOST|localhost|g' .env
+
+      - name: Run tests
+        env:
+          LOCAL_OLLAMA_URL: "http://localhost:11434/v1"
+          REMOTE_OLLAMA_URL: "http://localhost:11435/v1"
+          LOG_LEVEL: "WARNING"
+        run: |
+          pytest tests/ -v --tb=short \
+            --cov=. \
+            --cov-omit="tests/*,venv/*,.venv/*" \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -m "not requires_ollama and not requires_vina and not requires_network"
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        if: matrix.python-version == '3.11'
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
+
+  type-check:
+    name: Type Check (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install mypy types-requests
+          pip install -r requirements.txt
+
+      - name: Run mypy
+        run: |
+          mypy agents/ tools/ utils/ config.py main.py \
+            --ignore-missing-imports \
+            --no-strict-optional \
+            || true   # non-blocking for now; tighten gradually

@@ -1,0 +1,221 @@
+# drug_discovery_pipeline/.gitignore
+# =============================================================================
+# FILE: .gitignore
+# ROLE: Prevent sensitive, generated, and large binary files from being
+#       committed to version control.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# ── SECRETS & ENVIRONMENT ───────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+.env
+.env.local
+.env.*.local
+*.secret
+secrets/
+credentials/
+
+# ---------------------------------------------------------------------------
+# ── PYTHON ──────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.pyo
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+pytest.ini
+test-results/
+
+# ---------------------------------------------------------------------------
+# ── VIRTUAL ENVIRONMENTS ────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+conda-env/
+.conda/
+*.conda
+
+# ---------------------------------------------------------------------------
+# ── PIPELINE OUTPUTS (generated at runtime) ─────────────────────────────────
+# ---------------------------------------------------------------------------
+
+# Generated reports (keep the directory, ignore contents)
+outputs/
+!outputs/.gitkeep
+
+# Working directory (temp PDB, PDBQT, SDF files)
+workdir/
+!workdir/.gitkeep
+
+# ChromaDB vector store (large binary, rebuilt automatically)
+chroma_db/
+!chroma_db/.gitkeep
+
+# Pipeline log files
+*.log
+logs/
+
+# ---------------------------------------------------------------------------
+# ── MOLECULAR / STRUCTURAL FILES ────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+# PDB structure files (downloaded at runtime from RCSB)
+*.pdb
+*.pdbqt
+*.sdf
+*.mol
+*.mol2
+*.xyz
+*.cif
+
+# Docking output files
+*_out.pdbqt
+*_docked.pdbqt
+docking_results/
+
+# ---------------------------------------------------------------------------
+# ── JUPYTER NOTEBOOKS ───────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+.ipynb_checkpoints/
+*.ipynb
+
+# Notebook output (keep notebooks, strip outputs)
+# (Use nbstripout: pip install nbstripout && nbstripout --install)
+
+# ---------------------------------------------------------------------------
+# ── DATA FILES ──────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+# Large datasets
+*.csv.gz
+*.parquet
+*.feather
+*.h5
+*.hdf5
+data/raw/
+data/processed/
+
+# Keep small example data files
+!data/examples/
+
+# ---------------------------------------------------------------------------
+# ── IDEs & EDITORS ──────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# PyCharm / JetBrains
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# Vim/Neovim
+*.swp
+*.swo
+*~
+.netrwhist
+Session.vim
+
+# Emacs
+*~
+\#*\#
+.\#*
+*.elc
+auto-save-list
+tramp
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# ---------------------------------------------------------------------------
+# ── OPERATING SYSTEM ────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ---------------------------------------------------------------------------
+# ── DOCKER ──────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+.dockerignore
+
+# ---------------------------------------------------------------------------
+# ── MISC ────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+*.bak
+*.tmp
+*.temp
+*.orig
+*.rej
+.benchmarks/
+profile_output/
+*.prof

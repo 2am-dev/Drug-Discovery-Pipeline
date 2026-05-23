@@ -1,0 +1,70 @@
+┌─────────────────────────────────────────────────────────────────┐
+│                         MAIN ENTRY POINT                         │
+│                          main.py                                 │
+└─────────────────────┬───────────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    ORCHESTRATOR AGENT                            │
+│                    agents/planner.py                             │
+│  • Decomposes task into phases                                   │
+│  • Manages shared pipeline state (dict)                          │
+│  • Calls agents sequentially                                     │
+│  • Collects & routes results                                     │
+└──┬──────────┬──────────┬──────────┬──────────┬──────────┬───────┘
+   │          │          │          │          │          │
+   ▼          ▼          ▼          ▼          ▼          ▼
+┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────────┐
+│RETR- │ │HYPO- │ │MOLE- │ │DOCK- │ │SYNTH-│ │REPORT    │
+│IEVER │ │THESIS│ │CULE  │ │ING   │ │ESIS  │ │COMPILER  │
+│AGENT │ │AGENT │ │DESIGN│ │EVAL  │ │EVAL  │ │AGENT     │
+│      │ │      │ │AGENT │ │AGENT │ │AGENT │ │          │
+└──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └────┬─────┘
+   │        │        │        │        │           │
+   ▼        ▼        ▼        ▼        ▼           ▼
+┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────────┐
+│TOOLS │ │ LLM  │ │TOOLS │ │TOOLS │ │TOOLS │ │ outputs/ │
+│• lit │ │(Ollama│ │• mol │ │• dock│ │• SA  │ │ .md/.pdf │
+│• pat │ │ LLM) │ │  gen │ │  vina│ │  scr │ │          │
+│• tgt │ │      │ │• rdkit│ │      │ │• LLM │ │          │
+└──┬───┘ └──────┘ └──┬───┘ └──┬───┘ └──┬───┘ └──────────┘
+   │                 │        │        │
+   ▼                 ▼        ▼        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     SHARED INFRASTRUCTURE                        │
+│  config.py          utils/prompts.py        utils/helpers.py    │
+│  • Model names      • All LLM prompt         • ChromaDB init    │
+│  • API endpoints      templates              • Embedding helper  │
+│  • File paths       • System messages        • Logging setup    │
+│  • Thresholds                                • File I/O utils   │
+└─────────────────────────────────────────────────────────────────┘
+
+SHARED STATE DICT (passed through all agents):
+{
+  "input":          str,   # original user query
+  "plan":           list,  # planner phases
+  "literature":     dict,  # papers, abstracts, key findings
+  "patents":        dict,  # patent claims, scaffolds
+  "target_info":    dict,  # UniProt, PDB, gene name
+  "hypothesis":     dict,  # selected target + MoA statement
+  "candidates":     list,  # generated SMILES + properties
+  "docking_results":list,  # binding scores per candidate
+  "synthesis":      dict,  # SA scores + retrosynthetic routes
+  "report":         str,   # final compiled Markdown
+  "errors":         list,  # captured non-fatal errors
+  "metadata":       dict,  # timestamps, run ID
+}
+
+TOOL LAYER (called by agents, not by each other):
+┌─────────────────┬─────────────────┬────────────────────────────┐
+│literature_search│  patent_search  │       target_lookup        │
+│ • PubMed/Entrez │ • PatentsView   │ • UniProt REST             │
+│ • ChromaDB vec  │ • WIPO fallback │ • RCSB PDB                 │
+│   store + embed │ • SMILES extract│ • Structure download       │
+├─────────────────┼─────────────────┼────────────────────────────┤
+│molecule_generator│   docking.py   │    synthesis_checker       │
+│ • Fragment-based│ • Vina CLI wrap │ • RDKit SA score           │
+│   SMILES builder│ • PDBQT convert │ • LLM retrosynthesis       │
+│ • Lipinski/QED  │ • Mock fallback │ • PAINS filter             │
+│ • PAINS filter  │ • Score parser  │ • Route proposal           │
+└─────────────────┴─────────────────┴────────────────────────────┘
