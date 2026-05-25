@@ -26,8 +26,6 @@ main.py
 - **Tools** (`tools/`) – thin wrappers around external APIs (UniProt, PubMed, PatentsView) and computational tools (RDKit, Vina).
 - **Utils** (`utils/`) – prompts, LLM/embedding helpers, logging.
 
----
-
 ## Prerequisites
 
 1. **Python 3.10+**

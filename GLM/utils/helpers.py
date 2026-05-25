@@ -1,6 +1,7 @@
 # drug_discovery_pipeline/utils/helpers.py
 """
-Shared utilities: LLM / embedding clients, logging setup, common helpers.
+Shared utilities – dual-server LLM routing, embeddings, health check.
+All server URLs come from config.py (which loads .env).
 """
 
 from __future__ import annotations
@@ -11,94 +12,181 @@ from typing import List
 
 from openai import OpenAI
 
-from config import (
-    OLLAMA_BASE_URL,
-    OLLAMA_API_KEY,
-    LLM_MODEL,
-    EMBEDDING_MODEL,
-    LLM_TIMEOUT,
-    LLM_MAX_RETRIES,
-    LOG_LEVEL,
-)
+import config
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 def setup_logging() -> None:
-    """Configure root logger for the pipeline."""
     logging.basicConfig(
-        level=getattr(logging, LOG_LEVEL, logging.INFO),
+        level=getattr(logging, config.LOG_LEVEL, logging.INFO),
         format="%(asctime)s │ %(name)-28s │ %(levelname)-7s │ %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
 
-# ── LLM client singleton ─────────────────────────────────────────────────────
+# ── Client cache ──────────────────────────────────────────────────────────────
 
-_llm_client: OpenAI | None = None
-
-
-def get_llm_client() -> OpenAI:
-    """Return a singleton OpenAI client pointed at the local Ollama server."""
-    global _llm_client
-    if _llm_client is None:
-        _llm_client = OpenAI(
-            base_url=OLLAMA_BASE_URL,
-            api_key=OLLAMA_API_KEY,
-            timeout=LLM_TIMEOUT,
-        )
-    return _llm_client
+_clients: dict[str, OpenAI] = {}
 
 
-# ── LLM call wrapper ─────────────────────────────────────────────────────────
+def _get_client(base_url: str, api_key: str) -> OpenAI:
+    key = f"{base_url}:{api_key}"
+    if key not in _clients:
+        _clients[key] = OpenAI(base_url=base_url, api_key=api_key, timeout=config.LLM_TIMEOUT)
+    return _clients[key]
+
+
+def _get_remote_client() -> OpenAI:
+    return _get_client(config.REMOTE_OLLAMA_BASE_URL, config.REMOTE_OLLAMA_API_KEY)
+
+
+def _get_local_client() -> OpenAI:
+    return _get_client(config.LOCAL_OLLAMA_BASE_URL, config.LOCAL_OLLAMA_API_KEY)
+
+
+def _get_embedding_client() -> OpenAI:
+    return _get_client(config.EMBEDDING_BASE_URL, config.EMBEDDING_API_KEY)
+
+
+# ── Route resolution ─────────────────────────────────────────────────────────
+
+def _resolve_route(task: str) -> str:
+    return config.TASK_ROUTES.get(task, "heavy")
+
+
+def _get_models_for_tier(tier: str) -> List[str]:
+    if tier == "heavy":
+        return [config.REMOTE_LLM_MODEL] + list(config.REMOTE_LLM_FALLBACKS)
+    return [config.LOCAL_LLM_MODEL] + list(config.LOCAL_LLM_FALLBACKS)
+
+
+# ── Build a lookup: model name → (client, tier) ──────────────────────────────
+
+def _model_client_map() -> dict[str, tuple[OpenAI, str]]:
+    m: dict[str, tuple[OpenAI, str]] = {}
+    for model in [config.REMOTE_LLM_MODEL] + list(config.REMOTE_LLM_FALLBACKS):
+        m[model] = (_get_remote_client(), "heavy")
+    for model in [config.LOCAL_LLM_MODEL] + list(config.LOCAL_LLM_FALLBACKS):
+        m[model] = (_get_local_client(), "light")
+    return m
+
+
+# ── Core LLM call with automatic failover ─────────────────────────────────────
 
 def call_llm(
     prompt: str,
     system: str = "",
     temperature: float = 0.7,
     max_tokens: int = 4096,
+    task: str = "heavy",
 ) -> str:
     """
-    Send a chat-completion request to the Ollama-hosted LLM.
-    Retries up to ``LLM_MAX_RETRIES`` times with exponential back-off.
+    Send a chat-completion request, routing to the correct server
+    based on *task*.  Falls back through the model list on failure.
     """
     logger = logging.getLogger("helpers.call_llm")
-    client = get_llm_client()
+    tier = _resolve_route(task)
+    models = _get_models_for_tier(tier)
+    client = _get_remote_client() if tier == "heavy" else _get_local_client()
+    mmap = _model_client_map()
+
     messages: list[dict] = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    for attempt in range(1, LLM_MAX_RETRIES + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=LLM_MODEL,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            return resp.choices[0].message.content.strip()
-        except Exception as exc:
-            logger.warning("LLM call failed (attempt %d/%d): %s", attempt, LLM_MAX_RETRIES, exc)
-            if attempt < LLM_MAX_RETRIES:
-                time.sleep(2 ** attempt)
-            else:
-                raise RuntimeError(f"LLM call failed after {LLM_MAX_RETRIES} attempts: {exc}") from exc
-    return ""  # unreachable but keeps mypy happy
+    last_exc: Exception | None = None
+
+    for model in models:
+        current_client, _ = mmap.get(model, (client, tier))
+
+        for attempt in range(1, config.LLM_MAX_RETRIES + 1):
+            try:
+                logger.debug(
+                    "Calling model=%s  tier=%s  task=%s  attempt=%d",
+                    model, tier, task, attempt,
+                )
+                resp = current_client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                content = resp.choices[0].message.content.strip()
+                logger.info("✓ task=%s  model=%s  chars=%d", task, model, len(content))
+                return content
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "LLM call failed  model=%s  attempt=%d/%d: %s",
+                    model, attempt, config.LLM_MAX_RETRIES, exc,
+                )
+                if attempt < config.LLM_MAX_RETRIES:
+                    time.sleep(2 ** attempt)
+
+        logger.warning("Model %s exhausted all retries – trying next fallback.", model)
+
+    raise RuntimeError(
+        f"All LLM models failed for task='{task}'. Last error: {last_exc}"
+    )
 
 
-# ── Embedding wrapper ─────────────────────────────────────────────────────────
+# ── Convenience wrappers ──────────────────────────────────────────────────────
+
+def call_llm_heavy(prompt: str, **kwargs) -> str:
+    return call_llm(prompt, task="heavy", **kwargs)
+
+
+def call_llm_light(prompt: str, **kwargs) -> str:
+    return call_llm(prompt, task="light", **kwargs)
+
+
+# ── Embeddings (always local) ─────────────────────────────────────────────────
 
 def get_embeddings(texts: List[str]) -> List[List[float]]:
-    """Return embeddings for *texts* using the configured Ollama embedding model."""
     logger = logging.getLogger("helpers.get_embeddings")
-    client = get_llm_client()
-    # Ollama's OpenAI-compatible endpoint handles batched inputs
-    resp = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+    client = _get_embedding_client()
+    resp = client.embeddings.create(model=config.EMBEDDING_MODEL, input=texts)
+    logger.info("Embedded %d texts with %s.", len(texts), config.EMBEDDING_MODEL)
     return [item.embedding for item in resp.data]
+
+
+# ── Health check ──────────────────────────────────────────────────────────────
+
+def check_servers() -> dict:
+    """
+    Ping both Ollama servers + embedding endpoint.
+    Returns a dict with ok/error per server.
+    """
+    logger = logging.getLogger("helpers.check_servers")
+    results: dict = {}
+
+    for label, base_url, api_key, model in [
+        ("remote",     config.REMOTE_OLLAMA_BASE_URL, config.REMOTE_OLLAMA_API_KEY, config.REMOTE_LLM_MODEL),
+        ("local",      config.LOCAL_OLLAMA_BASE_URL,  config.LOCAL_OLLAMA_API_KEY,  config.LOCAL_LLM_MODEL),
+        ("embeddings", config.EMBEDDING_BASE_URL,     config.EMBEDDING_API_KEY,     config.EMBEDDING_MODEL),
+    ]:
+        try:
+            c = _get_client(base_url, api_key)
+            if label == "embeddings":
+                c.embeddings.create(model=model, input=["ping"])
+                results[label] = {"ok": True, "model": model}
+            else:
+                resp = c.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=1,
+                )
+                results[label] = {"ok": True, "model": resp.model}
+            logger.info("✓ %s server OK – %s @ %s", label, model, base_url)
+        except Exception as exc:
+            results[label] = {"ok": False, "error": str(exc)}
+            logger.error("✗ %s server FAILED – %s @ %s: %s", label, model, base_url, exc)
+
+    return results
 
 
 # ── Misc helpers ──────────────────────────────────────────────────────────────
 
 def sanitize_filename(name: str) -> str:
-    """Make a string safe for use as a file name component."""
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
