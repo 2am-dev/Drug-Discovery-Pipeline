@@ -1,10 +1,8 @@
 # drug_discovery_pipeline/agents/hypothesis.py
 """
 Hypothesis Agent – Target Selection & Mechanistic Hypothesis.
-
-1. Looks up candidate targets from UniProt.
-2. Uses the LLM to rank them and formulate a hypothesis.
-3. Resolves the best available PDB structure.
+Routes to REMOTE (heavy) server for deep reasoning.
+Falls back to first UniProt target if LLM returns empty.
 """
 
 from __future__ import annotations
@@ -30,10 +28,16 @@ class HypothesisAgent:
         # ── Look up targets ──────────────────────────────────────────────
         targets = lookup_target(query, limit=5)
         if not targets:
-            # Try broader search
+            # Try first word only
             targets = lookup_target(query.split()[0], limit=5)
+        if not targets:
+            # Try common Alzheimer targets as last resort
+            for fallback in ["BACE1", "Tau protein MAPT", "APP", "TREM2"]:
+                targets = lookup_target(fallback, limit=3)
+                if targets:
+                    logger.info("Used fallback target search: '%s' → %d results", fallback, len(targets))
+                    break
 
-        # Also search for each literature-mentioned gene if available
         target_text = ""
         if targets:
             for t in targets:
@@ -43,9 +47,9 @@ class HypothesisAgent:
                     f"[{t['organism']}] PDB: {pdb_str}\n"
                 )
         else:
-            target_text = "No targets found via UniProt – please specify a target gene."
+            target_text = "No targets found via UniProt."
 
-        # ── Format literature & patents for prompt ───────────────────────
+        # ── Format evidence ──────────────────────────────────────────────
         lit_text = ""
         for art in state.get("literature_results", [])[:8]:
             lit_text += f"[PMID: {art.get('pmid', '?')}] {art.get('title', '')}\n{art.get('text', '')[:300]}\n\n"
@@ -54,17 +58,41 @@ class HypothesisAgent:
         for p in state.get("patent_results", [])[:5]:
             pat_text += f"[Patent: {p.get('patent_number', '?')}] {p.get('title', '')} ({p.get('date', '')})\n{(p.get('abstract', '') or '')[:300]}\n\n"
 
-        # ── LLM hypothesis generation ────────────────────────────────────
+        # ── LLM hypothesis → HEAVY (remote server) ──────────────────────
         prompt = HYPOTHESIS_PROMPT.format(
             input=query,
             literature=lit_text or "No literature available.",
             patents=pat_text or "No patent data available.",
             targets=target_text,
         )
-        response = call_llm(prompt, system=HYPOTHESIS_SYSTEM, temperature=0.4, max_tokens=1024)
+        response = call_llm(
+            prompt,
+            system=HYPOTHESIS_SYSTEM,
+            temperature=0.4,
+            max_tokens=1024,
+            task="hypothesis",
+        )
 
         # ── Parse response ───────────────────────────────────────────────
         parsed = self._parse_response(response)
+
+        # ── Fallback: if LLM returned empty, use first UniProt target ───
+        if not parsed.get("selected_target") and targets:
+            best = targets[0]
+            parsed["selected_target"] = best["gene"]
+            parsed["uniprot_id"] = best["accession"]
+            parsed["pdb_id"] = best["pdb_ids"][0] if best["pdb_ids"] else "N/A"
+            parsed["hypothesis"] = (
+                f"Inhibition of {best['gene']} ({best['protein_name']}) is hypothesised "
+                f"to modulate the disease pathway for {query}, reducing pathological "
+                f"progression through small-molecule binding to the active site."
+            )
+            parsed["justification"] = (
+                f"{best['gene']} was selected as the top UniProt result with available "
+                f"structural data (PDB: {parsed['pdb_id']}) and strong disease association."
+            )
+            logger.warning("LLM returned empty hypothesis – using fallback target: %s", best["gene"])
+
         parsed["raw_response"] = response
 
         # Resolve PDB ID if missing
@@ -89,11 +117,8 @@ class HypothesisAgent:
         )
         return state
 
-    # ── Helpers ───────────────────────────────────────────────────────────
-
     @staticmethod
     def _parse_response(text: str) -> dict:
-        """Extract structured fields from the LLM's YAML-like response."""
         result: dict = {
             "selected_target": "",
             "uniprot_id": "",
@@ -101,7 +126,9 @@ class HypothesisAgent:
             "hypothesis": "",
             "justification": "",
         }
-        # Simple key: value parsing
+        if not text:
+            return result
+
         patterns = {
             "selected_target": r"selected_target:\s*(.+)",
             "uniprot_id": r"uniprot_id:\s*(.+)",
@@ -112,7 +139,6 @@ class HypothesisAgent:
             if m:
                 result[key] = m.group(1).strip()
 
-        # Multi-line fields (hypothesis, justification)
         for field in ("hypothesis", "justification"):
             m = re.search(rf"{field}:\s*\|?\s*\n((?:  .+\n?)+)", text)
             if m:

@@ -1,9 +1,8 @@
 # drug_discovery_pipeline/agents/retriever.py
 """
 Retriever Agent – Literature & Patent Mining.
-
-Uses the LLM to expand the user query into focused search terms, then
-delegates to the literature and patent search tools.
+Search-query generation → LIGHT (local server).
+Embeddings             → LOCAL (nomic-embed-text).
 """
 
 from __future__ import annotations
@@ -26,31 +25,34 @@ class RetrieverAgent:
         query = state.get("input", "")
         logger.info("RetrieverAgent starting for: '%s'", query)
 
-        # ── Generate search queries via LLM ──────────────────────────────
+        # ── Generate search queries → LIGHT (local server) ──────────────
         lit_queries_text = call_llm(
             SEARCH_QUERY_PROMPT.format(input=query),
             temperature=0.3,
             max_tokens=256,
+            task="search_queries",          # ← LOCAL
         )
         lit_queries = [q.strip() for q in lit_queries_text.strip().splitlines() if q.strip()]
         if not lit_queries:
             lit_queries = [query]
+        logger.info("Literature queries (%d): %s", len(lit_queries), lit_queries)
 
         pat_queries_text = call_llm(
             PATENT_QUERY_PROMPT.format(input=query),
             temperature=0.3,
             max_tokens=128,
+            task="patent_queries",          # ← LOCAL
         )
         pat_queries = [q.strip() for q in pat_queries_text.strip().splitlines() if q.strip()]
         if not pat_queries:
             pat_queries = [query]
+        logger.info("Patent queries (%d): %s", len(pat_queries), pat_queries)
 
-        # ── Literature search ────────────────────────────────────────────
+        # ── Literature search (embeddings handled locally) ───────────────
         all_lit: list[dict] = []
         for q in lit_queries:
             results = search_literature(q, top_k=8)
             all_lit.extend(results)
-        # Deduplicate by pmid
         seen_pmids: set[str] = set()
         unique_lit: list[dict] = []
         for art in all_lit:
@@ -64,7 +66,6 @@ class RetrieverAgent:
         for q in pat_queries:
             results = search_patents(q, top_k=8)
             all_pat.extend(results)
-        # Deduplicate by patent_number
         seen_pn: set[str] = set()
         unique_pat: list[dict] = []
         for p in all_pat:

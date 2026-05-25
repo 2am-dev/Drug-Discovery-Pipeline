@@ -1,15 +1,12 @@
 # drug_discovery_pipeline/tools/molecule_generator.py
 """
 Molecule generation using scaffold-based fragment combination and
-rule-based mutation.  All generation is done locally with RDKit – no
-external model required.
+rule-based mutation.  All generation is done locally with RDKit.
 
-Pipeline:
-  1. Combine scaffolds + R-groups at [*] attachment points.
-  2. Mutate seed molecules (fluorination, methylation, hetero-atom swap).
-  3. Deduplicate and validate.
-  4. Filter by Lipinski Rule-of-5, QED, SA Score, PAINS.
-  5. Shortlist top-N by QED × (1 / SA) composite score.
+Fixes:
+  - Corrected R-group SMILES (CF3 → C(F)(F)F, etc.)
+  - Added minimum heavy-atom count filter (≥ 8)
+  - Improved fragment combination robustness
 """
 
 from __future__ import annotations
@@ -18,7 +15,7 @@ import logging
 import random
 import sys
 import os
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 
 from rdkit import Chem
 from rdkit.Chem import AllChem, Descriptors, Lipinski, rdMolDescriptors
@@ -27,7 +24,7 @@ from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
 
 logger = logging.getLogger(__name__)
 
-# ── SA-Score import (contrib module, may not be available) ────────────────────
+# ── SA-Score import ───────────────────────────────────────────────────────────
 
 HAS_SA_SCORE = False
 try:
@@ -41,7 +38,7 @@ except Exception:
     pass
 
 
-# ── PAINS filter catalog (built once) ────────────────────────────────────────
+# ── PAINS filter catalog ─────────────────────────────────────────────────────
 
 def _build_pains_catalog() -> FilterCatalog:
     params = FilterCatalogParams()
@@ -53,68 +50,80 @@ def _build_pains_catalog() -> FilterCatalog:
 
 _PAINS_CATALOG = _build_pains_catalog()
 
-# ── Fragment libraries ────────────────────────────────────────────────────────
+# ── Fragment libraries (FIXED SMILES) ─────────────────────────────────────────
 
 MONO_SCAFFOLDS: list[str] = [
-    "[*]c1ccccc1",
-    "[*]c1cccnc1",
-    "[*]c1ccncc1",
-    "[*]c1cncnc1",
-    "[*]c1ccc2[nH]ccc2c1",
-    "[*]c1ccc2ccccc2c1",
-    "[*]C(=O)N1CCCC1",
-    "[*]c1ccc2c(c1)nc(nc2)=O",
-    "[*]c1ccco1",
-    "[*]c1cccs1",
-    "[*]c1ccn[nH]1",
-    "[*]C1CCNCC1",
-    "[*]c1ccc2c(c1)CCNC2=O",
-    "[*]c1nc2ccccc2n1C",
+    "[*]c1ccccc1",           # phenyl
+    "[*]c1cccnc1",           # pyridine-2
+    "[*]c1ccncc1",           # pyridine-3
+    "[*]c1cncnc1",           # pyrimidine
+    "[*]c1ccc2[nH]ccc2c1",   # indole
+    "[*]c1ccc2ccccc2c1",     # naphthalene
+    "[*]C(=O)N1CCCC1",       # pyrrolidinone
+    "[*]c1ccc2c(c1)nc(nc2)=O", # quinazolinone
+    "[*]c1ccco1",            # furan
+    "[*]c1cccs1",            # thiophene
+    "[*]c1ccn[nH]1",         # pyrazole
+    "[*]C1CCNCC1",           # piperidine
+    "[*]c1ccc2c(c1)CCNC2=O", # isoindolinone
+    "[*]c1nc2ccccc2n1C",     # benzimidazole
+    "[*]c1ccc2c(c1)CCNC2",   # isoindoline
+    "[*]C2=C1C=CC=CC1=N2",   # quinoline
 ]
 
 DI_SCAFFOLDS: list[str] = [
-    "[*]c1ccc(cc1)[*]",
-    "[*]c1ccc(nc1)[*]",
-    "[*]c1cnc(nc1)[*]",
-    "[*]N1CCN(CC1)[*]",
-    "[*]C(=O)NC([*])=O",
-    "[*]c1ccc2c(c1)ccc(nc2)[*]",
+    "[*]c1ccc(cc1)[*]",            # para-phenyl
+    "[*]c1ccc(nc1)[*]",            # para-pyridine
+    "[*]c1cnc(nc1)[*]",            # pyrimidine-4,6
+    "[*]N1CCN(CC1)[*]",            # piperazine
+    "[*]C(=O)NC([*])=O",           # oxalamide
+    "[*]c1ccc2c(c1)ccc(nc2)[*]",   # quinoline-6,7
+    "[*]c1ccc(cc1)C(=O)[*]",       # benzoyl
+    "[*]c1ccc(cc1)O[*]",           # diphenyl ether
 ]
 
 R_GROUPS: list[str] = [
     "[*]C",
     "[*]CC",
     "[*]CCC",
-    "[*]C(C)C",
+    "[*]C(C)C",         # isopropyl
     "[*]O",
     "[*]OC",
     "[*]OCC",
     "[*]F",
     "[*]Cl",
-    "[*]CF3",
+    "[*]C(F)(F)F",      # trifluoromethyl  ← FIXED
     "[*]NC",
     "[*]NCC",
     "[*]C(=O)C",
     "[*]C(=O)OC",
     "[*]C(=O)N(C)C",
     "[*]SC",
-    "[*]SO2C",
+    "[*]S(=O)(=O)C",    # methylsulfonyl   ← FIXED
     "[*]CN",
     "[*]C(=O)NC",
-    "[*]N1CCCC1",
+    "[*]N1CCCC1",        # pyrrolidine
+    "[*]OCCF",           # 2-fluoroethoxy
+    "[*]C#N",            # cyano
+    "[*]OC(F)(F)F",      # trifluoromethoxy ← FIXED
 ]
 
 SEED_MOLECULES: list[str] = [
-    "CC(=O)Oc1ccccc1C(=O)O",
-    "c1ccccc1C(=O)NCC2CCNCC2",
-    "Cc1nc2ccccc2c(=O)n1C",
-    "CC(=O)Nc1cccc(O)c1",
-    "c1ccccc1S(=O)(=O)NC2CCNCC2",
-    "Cc1ccnc(N2CCN(C)CC2)c1",
-    "Cc1ccc2c(c1)cc(nc2=O)N3CCCC3",
-    "c1ccccc1C(=O)NC2CCOCC2",
-    "FCc1ccc(O)c(O)c1",
-    "O=C1NC2=CC=CC=C2C(=O)N1C",
+    "CC(=O)Oc1ccccc1C(=O)O",                          # aspirin scaffold
+    "c1ccccc1C(=O)NCC2CCNCC2",                        # benzamide-piperidine
+    "Cc1nc2ccccc2c(=O)n1C",                            # phenytoin-like
+    "CC(=O)Nc1cccc(O)c1",                              # acetaminophen-like
+    "Cc1ccc2c(c1)cc(nc2=O)N3CCCC3",                   # quinazolinone-pyrrolidine
+    "Cc1ccnc(N2CCN(C)CC2)c1",                          # aminopyridine-piperazine
+    "c1ccccc1S(=O)(=O)NC2CCNCC2",                     # sulfonylpiperazine
+    "O=C1NC2=CC=CC=C2C(=O)N1C",                       # phthalimide
+    "FCc1ccc(O)c(O)c1",                                # fluorocatechol
+    "c1ccc(-c2cccnc2)cc1",                             # biphenyl-pyridine
+    "CC(=O)Nc1ccc(O)cc1",                              # acetaminophen
+    "O=c1nc(-c2ccccc2)nc2ccccc12",                    # quinazoline-phenyl
+    "c1ccccc1C(=O)c2ccccc2",                           # benzophenone
+    "CC(C)c1ccc(O)cc1",                                # butylphenol
+    "c1ccnc(Nc2ccccc2)c1",                             # aminopyridine-phenyl
 ]
 
 
@@ -122,8 +131,8 @@ SEED_MOLECULES: list[str] = [
 
 def _combine_at_dummy(scaffold_smiles: str, rgroup_smiles_list: list[str]) -> Optional[Chem.Mol]:
     """
-    Combine a scaffold with one or more R-groups at ``[*]`` attachment points.
-    Processes one R-group at a time to keep index arithmetic simple.
+    Combine a scaffold with R-groups at ``[*]`` attachment points.
+    Processes one R-group at a time.
     """
     current = Chem.MolFromSmiles(scaffold_smiles)
     if current is None:
@@ -167,16 +176,14 @@ def _combine_at_dummy(scaffold_smiles: str, rgroup_smiles_list: list[str]) -> Op
         rg_nbr_combined = rg_nbr_idx + n_current
         rg_dummy_combined = rg_dummy_idx + n_current
 
-        # Add bond between neighbours
         rw.AddBond(scaff_nbr_idx, rg_nbr_combined, Chem.BondType.SINGLE)
 
-        # Remove dummy atoms (higher index first to preserve lower indices)
         for idx in sorted([scaff_dummy_idx, rg_dummy_combined], reverse=True):
             rw.RemoveAtom(idx)
 
         try:
             Chem.SanitizeMol(rw)
-            current = Chem.Mol(rw)  # clean copy for next iteration
+            current = Chem.Mol(rw)
         except Exception:
             return None
 
@@ -186,12 +193,10 @@ def _combine_at_dummy(scaffold_smiles: str, rgroup_smiles_list: list[str]) -> Op
 # ── Mutation functions ────────────────────────────────────────────────────────
 
 def _add_fluorine(mol: Chem.Mol) -> Optional[Chem.Mol]:
-    """Add F to a random aromatic carbon that still has an implicit H."""
     rw = Chem.RWMol(mol)
     candidates = [
         a.GetIdx() for a in rw.GetAtoms()
-        if a.GetIsAromatic() and a.GetAtomicNum() == 6
-        and a.GetTotalNumHs() > 0
+        if a.GetIsAromatic() and a.GetAtomicNum() == 6 and a.GetTotalNumHs() > 0
     ]
     if not candidates:
         return None
@@ -206,11 +211,10 @@ def _add_fluorine(mol: Chem.Mol) -> Optional[Chem.Mol]:
 
 
 def _add_methyl(mol: Chem.Mol) -> Optional[Chem.Mol]:
-    """Add a methyl group to a non-quaternary carbon, nitrogen, or oxygen."""
     rw = Chem.RWMol(mol)
     candidates = []
     for a in rw.GetAtoms():
-        if a.GetAtomicNum() == 6 and a.GetTotalNumHs() > 0:
+        if a.GetAtomicNum() == 6 and a.GetTotalNumHs() > 0 and not a.GetIsAromatic():
             candidates.append(a.GetIdx())
         elif a.GetAtomicNum() == 7 and a.GetTotalNumHs() > 0:
             candidates.append(a.GetIdx())
@@ -227,7 +231,6 @@ def _add_methyl(mol: Chem.Mol) -> Optional[Chem.Mol]:
 
 
 def _replace_ch_with_n(mol: Chem.Mol) -> Optional[Chem.Mol]:
-    """Replace an aromatic CH with N (bioisostere)."""
     rw = Chem.RWMol(mol)
     candidates = [
         a.GetIdx() for a in rw.GetAtoms()
@@ -246,7 +249,6 @@ def _replace_ch_with_n(mol: Chem.Mol) -> Optional[Chem.Mol]:
 
 
 def _add_hydroxyl(mol: Chem.Mol) -> Optional[Chem.Mol]:
-    """Add OH to an aliphatic carbon with available H."""
     rw = Chem.RWMol(mol)
     candidates = [
         a.GetIdx() for a in rw.GetAtoms()
@@ -268,7 +270,6 @@ _MUTATORS = [_add_fluorine, _add_methyl, _replace_ch_with_n, _add_hydroxyl]
 
 
 def _mutate(mol: Chem.Mol, n_mutations: int = 2) -> Optional[Chem.Mol]:
-    """Apply up to *n_mutations* random mutations to *mol*."""
     current = mol
     for _ in range(n_mutations):
         mutator = random.choice(_MUTATORS)
@@ -281,13 +282,11 @@ def _mutate(mol: Chem.Mol, n_mutations: int = 2) -> Optional[Chem.Mol]:
 # ── Scoring helpers ───────────────────────────────────────────────────────────
 
 def compute_sa_score(mol: Chem.Mol) -> float:
-    """Return SA Score (1 = easy, 10 = hard).  Falls back to a heuristic."""
     if HAS_SA_SCORE:
         try:
             return round(sascorer.calculateScore(mol), 3)
         except Exception:
             pass
-    # Heuristic fallback
     n_rings = Chem.GetSSSR(mol)
     n_atoms = mol.GetNumAtoms()
     n_chiral = len(Chem.FindMolChiralCenters(mol, includeUnassigned=True))
@@ -295,7 +294,6 @@ def compute_sa_score(mol: Chem.Mol) -> float:
 
 
 def passes_lipinski(mol: Chem.Mol) -> bool:
-    """Check Lipinski Rule-of-5 (allow one violation)."""
     violations = 0
     if Descriptors.MolWt(mol) > 500:
         violations += 1
@@ -309,13 +307,16 @@ def passes_lipinski(mol: Chem.Mol) -> bool:
 
 
 def is_pains(mol: Chem.Mol) -> bool:
-    """Return True if *mol* matches a PAINS filter."""
     return _PAINS_CATALOG.HasMatch(mol)
 
 
 def _composite_score(qed_val: float, sa_val: float) -> float:
-    """Higher is better.  QED ∈ [0,1], SA ∈ [1,10]."""
     return qed_val / (sa_val / 5.0)
+
+
+# ── Minimum size check ───────────────────────────────────────────────────────
+
+MIN_HEAVY_ATOMS = 8   # filter out trivially small molecules like fluorobenzene
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -323,13 +324,12 @@ def _composite_score(qed_val: float, sa_val: float) -> float:
 def generate_molecules(pharmacophore_hints: str = "", n: int = 20) -> List[Dict]:
     """
     Generate *n* novel drug-like molecules.
-
     Returns a list of dicts with keys:
-        ``smiles``, ``mol`` (RDKit Mol), ``qed``, ``sa_score``, ``source``
+        ``smiles``, ``mol``, ``qed``, ``sa_score``, ``source``
     """
     raw_smiles: set[str] = set()
 
-    # ── Strategy 1: mono-scaffold + R-group ───────────────────────────────
+    # ── Strategy 1: mono-scaffold + R-group ──────────────────────────────
     for _ in range(n):
         scaff = random.choice(MONO_SCAFFOLDS)
         rg = random.choice(R_GROUPS)
@@ -338,7 +338,7 @@ def generate_molecules(pharmacophore_hints: str = "", n: int = 20) -> List[Dict]
             smi = Chem.MolToSmiles(mol)
             raw_smiles.add(smi)
 
-    # ── Strategy 2: di-scaffold + 2 R-groups ──────────────────────────────
+    # ── Strategy 2: di-scaffold + 2 R-groups ─────────────────────────────
     for _ in range(n // 2):
         scaff = random.choice(DI_SCAFFOLDS)
         rg1 = random.choice(R_GROUPS)
@@ -348,7 +348,7 @@ def generate_molecules(pharmacophore_hints: str = "", n: int = 20) -> List[Dict]
             smi = Chem.MolToSmiles(mol)
             raw_smiles.add(smi)
 
-    # ── Strategy 3: mutate seed molecules ─────────────────────────────────
+    # ── Strategy 3: mutate seed molecules ────────────────────────────────
     for seed_smi in SEED_MOLECULES:
         seed_mol = Chem.MolFromSmiles(seed_smi)
         if seed_mol is None:
@@ -360,7 +360,7 @@ def generate_molecules(pharmacophore_hints: str = "", n: int = 20) -> List[Dict]
 
     logger.info("Generated %d unique raw SMILES.", len(raw_smiles))
 
-    # ── Validate and score ────────────────────────────────────────────────
+    # ── Validate and score ───────────────────────────────────────────────
     molecules: list[dict] = []
     for smi in raw_smiles:
         mol = Chem.MolFromSmiles(smi)
@@ -370,6 +370,12 @@ def generate_molecules(pharmacophore_hints: str = "", n: int = 20) -> List[Dict]
             Chem.SanitizeMol(mol)
         except Exception:
             continue
+
+        # Filter out trivially small molecules
+        heavy_count = sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() > 1)
+        if heavy_count < MIN_HEAVY_ATOMS:
+            continue
+
         molecules.append({
             "smiles": Chem.MolToSmiles(mol),
             "mol": mol,
@@ -378,7 +384,7 @@ def generate_molecules(pharmacophore_hints: str = "", n: int = 20) -> List[Dict]
             "source": "generated",
         })
 
-    logger.info("Validated %d molecules.", len(molecules))
+    logger.info("Validated %d molecules (≥ %d heavy atoms).", len(molecules), MIN_HEAVY_ATOMS)
     return molecules
 
 
@@ -387,8 +393,7 @@ def filter_molecules(
     top_k: int = 5,
 ) -> List[Dict]:
     """
-    Apply drug-likeness filters and return the top-k candidates ranked by
-    a composite of QED and SA Score.
+    Apply drug-likeness filters and return top-k candidates.
     """
     filtered: list[dict] = []
     for m in molecules:
@@ -404,7 +409,6 @@ def filter_molecules(
         m["composite_score"] = round(_composite_score(m["qed"], m["sa_score"]), 4)
         filtered.append(m)
 
-    # Sort by composite score descending
     filtered.sort(key=lambda x: x["composite_score"], reverse=True)
     top = filtered[:top_k]
 

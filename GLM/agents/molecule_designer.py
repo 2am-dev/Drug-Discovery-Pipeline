@@ -1,10 +1,9 @@
 # drug_discovery_pipeline/agents/molecule_designer.py
 """
 Molecule Designer Agent.
-
-1. Extracts pharmacophore features via LLM.
-2. Generates candidate molecules using the fragment/mutation engine.
-3. Filters and shortlists the best candidates.
+Pharmacophore extraction → LIGHT (local).
+Molecule generation → pure RDKit (no LLM).
+Handles empty hypothesis gracefully.
 """
 
 from __future__ import annotations
@@ -27,21 +26,40 @@ class MoleculeDesignerAgent:
         logger.info("MoleculeDesignerAgent starting…")
 
         hypothesis = state.get("hypothesis", {})
-        target = hypothesis.get("target", state.get("input", ""))
-        uniprot_id = hypothesis.get("uniprot_id", "")
-        hypothesis_text = hypothesis.get("hypothesis", "")
+        target = hypothesis.get("target", "") or state.get("input", "")
+        uniprot_id = hypothesis.get("uniprot_id", "") or "unknown"
+        hypothesis_text = hypothesis.get("hypothesis", "") or (
+            f"A small-molecule modulator of {target} will reduce disease pathology."
+        )
 
-        # ── Extract pharmacophore features ───────────────────────────────
+        # ── Pharmacophore → LIGHT (local server) ─────────────────────────
         pharma_prompt = PHARMACOPHORE_PROMPT.format(
             target=target,
             uniprot_id=uniprot_id,
             hypothesis=hypothesis_text,
         )
-        pharmacophore = call_llm(pharma_prompt, temperature=0.4, max_tokens=512)
-        state["pharmacophore"] = pharmacophore
-        logger.info("Pharmacophore features extracted:\n%s", pharmacophore[:300])
+        pharmacophore = call_llm(
+            pharma_prompt,
+            temperature=0.4,
+            max_tokens=512,
+            task="pharmacophore",
+        )
 
-        # ── Generate molecules ───────────────────────────────────────────
+        # Fallback if pharmacophore is empty or unhelpful
+        if not pharmacophore or "haven't provided" in pharmacophore.lower() or len(pharmacophore) < 30:
+            pharmacophore = (
+                "- Hydrogen-bond acceptor (N or O) in the binding pocket\n"
+                "- Hydrophobic aromatic ring for π-stacking\n"
+                "- Hydrogen-bond donor for key polar interaction\n"
+                "- Moderate molecular weight (200-400 Da) region\n"
+                "- Optional halogen substituent for enhanced binding"
+            )
+            logger.warning("Using default pharmacophore (LLM response was empty/unhelpful).")
+
+        state["pharmacophore"] = pharmacophore
+        logger.info("Pharmacophore features:\n%s", pharmacophore[:300])
+
+        # ── Generate molecules (RDKit only – no LLM) ────────────────────
         raw_molecules = generate_molecules(
             pharmacophore_hints=pharmacophore,
             n=NUM_CANDIDATES_GENERATE,

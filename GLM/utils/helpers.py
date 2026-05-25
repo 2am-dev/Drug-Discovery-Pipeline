@@ -1,7 +1,7 @@
 # drug_discovery_pipeline/utils/helpers.py
 """
 Shared utilities – dual-server LLM routing, embeddings, health check.
-All server URLs come from config.py (which loads .env).
+Handles None content, empty responses, and automatic retry.
 """
 
 from __future__ import annotations
@@ -60,8 +60,6 @@ def _get_models_for_tier(tier: str) -> List[str]:
     return [config.LOCAL_LLM_MODEL] + list(config.LOCAL_LLM_FALLBACKS)
 
 
-# ── Build a lookup: model name → (client, tier) ──────────────────────────────
-
 def _model_client_map() -> dict[str, tuple[OpenAI, str]]:
     m: dict[str, tuple[OpenAI, str]] = {}
     for model in [config.REMOTE_LLM_MODEL] + list(config.REMOTE_LLM_FALLBACKS):
@@ -83,6 +81,7 @@ def call_llm(
     """
     Send a chat-completion request, routing to the correct server
     based on *task*.  Falls back through the model list on failure.
+    Retries once on empty response.
     """
     logger = logging.getLogger("helpers.call_llm")
     tier = _resolve_route(task)
@@ -112,9 +111,37 @@ def call_llm(
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
-                content = resp.choices[0].message.content.strip()
-                logger.info("✓ task=%s  model=%s  chars=%d", task, model, len(content))
-                return content
+
+                # ── Null-safe content extraction ─────────────────────
+                raw_content = resp.choices[0].message.content
+                content = (raw_content or "").strip()
+
+                # ── Retry once on empty response ─────────────────────
+                if not content and attempt == 1:
+                    logger.warning(
+                        "Empty response from model=%s task=%s – retrying…",
+                        model, task,
+                    )
+                    # Add a nudge message
+                    nudge_messages = messages + [
+                        {"role": "assistant", "content": ""},
+                        {"role": "user", "content": "Please provide your answer now. Do not leave it blank."},
+                    ]
+                    resp2 = current_client.chat.completions.create(
+                        model=model,
+                        messages=nudge_messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                    raw_content2 = resp2.choices[0].message.content
+                    content = (raw_content2 or "").strip()
+
+                if content:
+                    logger.info("✓ task=%s  model=%s  tier=%s  chars=%d", task, model, tier, len(content))
+                    return content
+                else:
+                    logger.warning("Still empty after nudge – model=%s task=%s", model, task)
+
             except Exception as exc:
                 last_exc = exc
                 logger.warning(
